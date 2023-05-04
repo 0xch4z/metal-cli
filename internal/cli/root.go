@@ -21,7 +21,10 @@
 package cli
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -63,16 +66,53 @@ type Client struct {
 	viper         *viper.Viper
 }
 
-type headerTransport struct {
+type requestWrapper struct {
 	header http.Header
+	body   map[string]any
 }
 
-func (t *headerTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+func (t *requestWrapper) RoundTrip(r *http.Request) (*http.Response, error) {
 	for key, values := range t.header {
 		for _, value := range values {
 			r.Header.Add(key, value)
 		}
 	}
+
+	if t.body != nil {
+		// We need to hijack the request, unmarshal the body, append JSON, then
+		// create a new request.
+
+		body, err := r.GetBody()
+		if err != nil {
+			return nil, fmt.Errorf("could not read request body: %w", err)
+		}
+		defer body.Close()
+
+		var payload map[string]any
+		if err := json.NewDecoder(body).Decode(&payload); err != nil {
+			return nil, fmt.Errorf("could not decode request body: %w", err)
+		}
+
+		for k, v := range t.body {
+			payload[k] = v
+		}
+
+		bodyBytes, err := json.Marshal(payload)
+		if err != nil {
+			return nil, err
+		}
+
+		newBody := bytes.NewBuffer(bodyBytes)
+		newRequest := &http.Request{
+			Method:        r.Method,
+			URL:           r.URL,
+			Header:        r.Header,
+			ContentLength: int64(newBody.Len()),
+			Body:          io.NopCloser(newBody),
+		}
+		return http.DefaultTransport.RoundTrip(newRequest)
+	}
+
 	return http.DefaultTransport.RoundTrip(r)
 }
 
@@ -123,18 +163,25 @@ func (c *Client) Config(cmd *cobra.Command) *viper.Viper {
 
 	flagToken := cmd.Flag("token").Value.String()
 	envToken := cmd.Flag("auth-token").Value.String()
+	appendJSON := cmd.Flag("append-json").Value.String()
+
+	transport := &requestWrapper{
+		header: getAdditionalHeaders(cmd),
+	}
+
+	if appendJSON != "" {
+		if err := json.Unmarshal([]byte(appendJSON), &transport.body); err != nil {
+			panic(fmt.Errorf("Could not unmarshal JSON to append to body: %w", err))
+		}
+	}
+
 	// TODO: are we ok with this being configured by file too? yes?
 	// TODO: let cli arg take higher priority
 	c.metalToken = flagToken
 	if envToken != "" {
 		c.metalToken = envToken
 	}
-
-	c.httpClient = &http.Client{
-		Transport: &headerTransport{
-			header: getAdditionalHeaders(cmd),
-		},
-	}
+	c.httpClient = &http.Client{Transport: transport}
 
 	return c.viper
 }
@@ -210,6 +257,7 @@ func (c *Client) NewCommand() *cobra.Command {
 	rootCmd.PersistentFlags().String("token", "", "Metal API Token (METAL_AUTH_TOKEN)")
 	rootCmd.PersistentFlags().String("auth-token", "", "Metal API Token (Alias)")
 	rootCmd.PersistentFlags().StringSlice("http-header", nil, "Headers to add to requests (in format key=value)")
+	rootCmd.PersistentFlags().String("append-json", "", "Append JSON to the request body")
 	authtoken := rootCmd.PersistentFlags().Lookup("auth-token")
 	authtoken.Hidden = true
 	rootCmd.PersistentFlags().StringVar(&c.cfgFile, "config", c.cfgFile, "Path to JSON or YAML configuration file")
